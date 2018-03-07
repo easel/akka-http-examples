@@ -4,13 +4,13 @@ import akka.NotUsed
 import akka.actor.ActorSystem
 import akka.http.scaladsl.Http
 import akka.http.scaladsl.model.{HttpEntity, HttpRequest, HttpResponse}
-import akka.stream.{ActorMaterializer, Materializer}
+import akka.stream.{ActorMaterializer, Attributes, Materializer}
 import akka.stream.scaladsl.{Flow, Framing, Sink, Source}
 import akka.testkit.TestKit
 import akka.util.ByteString
 import org.scalatest.{AsyncWordSpec, AsyncWordSpecLike, MustMatchers}
 import scala.concurrent.Future
-import scala.util.{Failure, Success}
+import scala.util.{Failure, Success, Try}
 import scala.concurrent.duration._
 
 import akka.http.scaladsl.settings.ConnectionPoolSettings
@@ -36,15 +36,16 @@ class RecursiveAkkaHttpSpec
   )
 
   // Must be power of 2 since we use it for maxOpenRequests
-  val Parallelism = 8
+  val Parallelism = 16
 
   lazy val pool = Http().superPool[String](
-    settings = ConnectionPoolSettings(system).withMaxOpenRequests(Parallelism))
+    settings = ConnectionPoolSettings(system).withMaxConnections(Parallelism))
 
   lazy val singleRequestPool = Http().superPool[String](
-    settings = ConnectionPoolSettings(system).withMaxOpenRequests(1))
+    settings = ConnectionPoolSettings(system).withMaxConnections(1))
 
-  val singleStreamingRequestConcatLinesFlow: Flow[HttpRequest, ByteString, NotUsed] =
+  val singleStreamingRequestConcatLinesFlow
+    : Flow[HttpRequest, ByteString, NotUsed] =
     Flow[HttpRequest]
       .map(x => (x, x.uri.toString))
       .via(singleRequestPool)
@@ -78,16 +79,20 @@ class RecursiveAkkaHttpSpec
           throw (e)
       })
 
+  val unbufferedStrictParser = Flow[(Try[HttpResponse], String)]
+    .mapAsyncUnordered(Parallelism) {
+      case (Success(response), _) =>
+        response.entity.toStrict(10.seconds).map(_.data)
+      case (Failure(e), _) =>
+        Future.failed(e)
+    }
+    .addAttributes(Attributes.inputBuffer(initial = 0, max = 0))
+
   val strictRequestFlow: Flow[HttpRequest, ByteString, NotUsed] =
     Flow[HttpRequest]
       .map(x => (x, x.uri.toString))
-      .via(pool)
-      .mapAsyncUnordered(Parallelism) {
-        case (Success(response), _) =>
-          response.entity.toStrict(10.seconds).map(_.data)
-        case (Failure(e), _) =>
-          Future.failed(e)
-      }
+      .via(singleRequestPool)
+      .via(unbufferedStrictParser)
 
   val parseFlow: Flow[ByteString, String, NotUsed] = Flow[ByteString]
     .via(
@@ -145,7 +150,7 @@ class RecursiveAkkaHttpSpec
               s must be >= combinedSize
             }
         }
-        s"request the files with a limited pool starting at $first and concat their lines as a stream (fails due to pool exhaustion, why?)" in {
+        s"request the files with a limited pool starting at $first and concat their lines as a stream" in {
           Source
             .fromIterator(() => requests.iterator)
             .via(singleStreamingRequestConcatLinesFlow)
@@ -192,6 +197,7 @@ class RecursiveAkkaHttpSpec
               s must be >= combinedSize
             }
         }
+        // this one really ought to work... we're only using a single connection at a time and not buffering
         s"request the files starting at $first and combine their lines via strict responses (fails due to timeout)" in {
           Source
             .fromIterator(() => requests.iterator)
