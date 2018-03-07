@@ -35,9 +35,27 @@ class RecursiveAkkaHttpSpec
     (secUrls, 973518, 17880456)
   )
 
-  lazy val pool = Http().superPool[String]()
+  // Must be power of 2 since we use it for maxOpenRequests
+  val Parallelism = 8
 
-  val streamingRequestFlow: Flow[HttpRequest, ByteString, NotUsed] =
+  lazy val pool = Http().superPool[String](
+    settings = ConnectionPoolSettings(system).withMaxOpenRequests(Parallelism))
+
+  lazy val singleRequestPool = Http().superPool[String](
+    settings = ConnectionPoolSettings(system).withMaxOpenRequests(1))
+
+  val singleStreamingRequestConcatLinesFlow: Flow[HttpRequest, ByteString, NotUsed] =
+    Flow[HttpRequest]
+      .map(x => (x, x.uri.toString))
+      .via(singleRequestPool)
+      .flatMapConcat {
+        case (Success(response), uri) =>
+          response.entity.dataBytes
+        case (Failure(e), uri) =>
+          throw (e)
+      }
+
+  val streamingRequestConcatLinesFlow: Flow[HttpRequest, ByteString, NotUsed] =
     Flow[HttpRequest]
       .map(x => (x, x.uri.toString))
       .via(pool)
@@ -48,11 +66,23 @@ class RecursiveAkkaHttpSpec
           throw (e)
       }
 
+  def streamingRequestMergeLinesFlow(
+      width: Int): Flow[HttpRequest, ByteString, NotUsed] =
+    Flow[HttpRequest]
+      .map(x => (x, x.uri.toString))
+      .via(pool)
+      .flatMapMerge(width, {
+        case (Success(response), uri) =>
+          response.entity.dataBytes
+        case (Failure(e), uri) =>
+          throw (e)
+      })
+
   val strictRequestFlow: Flow[HttpRequest, ByteString, NotUsed] =
     Flow[HttpRequest]
       .map(x => (x, x.uri.toString))
       .via(pool)
-      .mapAsync(1) {
+      .mapAsyncUnordered(Parallelism) {
         case (Success(response), _) =>
           response.entity.toStrict(10.seconds).map(_.data)
         case (Failure(e), _) =>
@@ -68,7 +98,7 @@ class RecursiveAkkaHttpSpec
 
   val requestAndParseFlow: Flow[HttpRequest, String, NotUsed] =
     Flow[HttpRequest]
-      .via(streamingRequestFlow)
+      .via(streamingRequestConcatLinesFlow)
       .via(parseFlow)
 
   val singleRequestConcatFlow: Flow[HttpRequest, String, NotUsed] =
@@ -97,7 +127,7 @@ class RecursiveAkkaHttpSpec
         s"request a single file from $first and combine its lines as a stream" in {
           Source
             .fromIterator(() => requests.iterator.take(1))
-            .via(streamingRequestFlow)
+            .via(streamingRequestConcatLinesFlow)
             .via(parseFlow)
             .runFold(0)(_ + _.size)
             .map { s =>
@@ -105,10 +135,30 @@ class RecursiveAkkaHttpSpec
             }
         }
 
-        s"request the files starting at $first and combine their lines as a stream" in {
+        s"request the files starting at $first and concat their lines as a stream(fails due to timeout)" in {
           Source
             .fromIterator(() => requests.iterator)
-            .via(streamingRequestFlow)
+            .via(streamingRequestConcatLinesFlow)
+            .via(parseFlow)
+            .runFold(0)(_ + _.size)
+            .map { s =>
+              s must be >= combinedSize
+            }
+        }
+        s"request the files with a limited pool starting at $first and concat their lines as a stream (fails due to pool exhaustion, why?)" in {
+          Source
+            .fromIterator(() => requests.iterator)
+            .via(singleStreamingRequestConcatLinesFlow)
+            .via(parseFlow)
+            .runFold(0)(_ + _.size)
+            .map { s =>
+              s must be >= combinedSize
+            }
+        }
+        s"request the files starting at $first and merge their lines as a stream" in {
+          Source
+            .fromIterator(() => requests.iterator)
+            .via(streamingRequestMergeLinesFlow(Parallelism))
             .via(parseFlow)
             .runFold(0)(_ + _.size)
             .map { s =>
@@ -127,7 +177,7 @@ class RecursiveAkkaHttpSpec
         s"request (and parse via flatMapMerge) the files starting at $first and combine their lines as a stream" in {
           Source
             .fromIterator(() => requests.iterator)
-            .via(singleRequestMergeFlow(10))
+            .via(singleRequestMergeFlow(Parallelism))
             .runFold(0)(_ + _.size)
             .map { s =>
               s must be >= combinedSize
@@ -136,20 +186,20 @@ class RecursiveAkkaHttpSpec
         s"request (and parse via mapAsync) the files starting at $first and combine their lines as a stream" in {
           Source
             .fromIterator(() => requests.iterator)
-            .via(singleRequestAsyncUnorderedFlow(10))
+            .via(singleRequestAsyncUnorderedFlow(Parallelism))
             .runFold(0)(_ + _.size)
             .map { s =>
               s must be >= combinedSize
             }
         }
-        s"request the files starting at $first and combine their lines via strict responses" ignore {
+        s"request the files starting at $first and combine their lines via strict responses (fails due to timeout)" in {
           Source
             .fromIterator(() => requests.iterator)
             .via(strictRequestFlow)
             .via(parseFlow)
             .runFold(0)(_ + _.size)
             .map { s =>
-              s mustEqual combinedSize
+              s must be >= combinedSize
             }
         }
     }
